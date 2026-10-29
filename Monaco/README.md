@@ -65,7 +65,9 @@ Reglas de validación:
   Convertir fórmulas a valores antes de importar.
 - El precio debe ser no negativo y puede usar coma o punto decimal, sin moneda ni
   separadores de miles. Se conserva exactamente su valor decimal, sin redondearlo,
-  y se almacena como texto con coma, sin ceros decimales finales innecesarios.
+  y se almacena como texto con **punto decimal**, sin ceros decimales finales
+  innecesarios. Por ejemplo, `0,16330` en Excel se guarda como `0.1633` en SQL,
+  tanto en inserciones como en actualizaciones.
 - Una lista como `9370,,9371` se rechaza porque contiene una característica vacía.
 - Una clave repetida con el mismo precio se procesa una sola vez. Si trae precios
   distintos, se rechaza el archivo y se indican las filas involucradas.

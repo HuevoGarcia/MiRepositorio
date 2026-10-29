@@ -29,13 +29,13 @@ class ExcelTests(unittest.TestCase):
         path = self.excel([["AFGHANISTAN", "AWCC", "09370, 9371", "0,16330"]])
         result = leer_excel(path)
         self.assertEqual([r.values() for r in result.registros], [
-            ("AFGHANISTAN", "AWCC", "09370", "0,1633"),
-            ("AFGHANISTAN", "AWCC", "9371", "0,1633"),
+            ("AFGHANISTAN", "AWCC", "09370", "0.1633"),
+            ("AFGHANISTAN", "AWCC", "9371", "0.1633"),
         ])
 
     def test_precio_numerico_y_codigo_entero(self):
         result = leer_excel(self.excel([["Malta", "Malta", 356, 0.18]]))
-        self.assertEqual(result.registros[0].values(), ("Malta", "Malta", "356", "0,18"))
+        self.assertEqual(result.registros[0].values(), ("Malta", "Malta", "356", "0.18"))
 
     def test_cada_campo_es_obligatorio(self):
         for index in range(4):
@@ -92,7 +92,7 @@ class ExcelTests(unittest.TestCase):
         book.close()
         result = leer_excel(path)
         self.assertEqual(result.filas, 1)
-        self.assertEqual(result.registros[0].values(), ("Malta", "Malta", "356", "0,18"))
+        self.assertEqual(result.registros[0].values(), ("Malta", "Malta", "356", "0.18"))
 
     def test_titulo_sin_encabezados_rechazado(self):
         book = Workbook()
@@ -112,9 +112,21 @@ class ExcelTests(unittest.TestCase):
         for value in ("-1", "1.000,25", "NaN", "Infinity", True, "USD 1", " "):
             with self.subTest(value=value), self.assertRaises(ValidationError):
                 precio(value)
-        self.assertEqual(precio("0,12345678901234567890"), "0,1234567890123456789")
+        self.assertEqual(precio("0,12345678901234567890"), "0.1234567890123456789")
         self.assertEqual(precio(0), "0")
-        self.assertEqual(precio(0.00001), "0,00001")
+        self.assertEqual(precio(0.00001), "0.00001")
+
+    def test_precio_normalizado_con_punto_para_parametros_sql(self):
+        for value in ("0,16330", "0.16330", 0.1633):
+            with self.subTest(value=value):
+                planilla = leer_excel(self.excel([["Malta", "Malta", "356", value]]))
+                connection = Mock()
+                connection.cursor.return_value.fetchone.side_effect = [None, (12,), None, (1, 0, 0)]
+                cargar(connection, planilla.registros, aplicar=True)
+                connection.cursor.return_value.executemany.assert_called_once_with(
+                    "INSERT INTO #MonacoCarga (Pais, Destino, Caracteristicas, Precio) VALUES (?, ?, ?, ?)",
+                    [("Malta", "Malta", "356", "0.1633")],
+                )
 
 
 class TransactionTests(unittest.TestCase):

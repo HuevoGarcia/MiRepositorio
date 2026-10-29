@@ -74,7 +74,7 @@ def precio(value):
     result = format(number, "f")
     if "." in result:
         result = result.rstrip("0").rstrip(".")
-    return texto(result.replace(".", ","), "Precio")
+    return texto(result, "Precio")
 
 
 def encabezado(value):
