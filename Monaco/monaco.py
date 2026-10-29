@@ -94,10 +94,11 @@ def leer_excel(path, hoja=""):
         if hoja and hoja not in workbook.sheetnames:
             raise ValidationError(f"No existe la hoja '{hoja}'.")
         sheet = workbook[hoja] if hoja else workbook.active
-        rows = sheet.iter_rows()
+        # La fila 1 es el título; la fila 2 contiene los encabezados.
+        rows = sheet.iter_rows(min_row=2)
         first = next(rows, None)
         if not first:
-            raise ValidationError("La hoja está vacía.")
+            raise ValidationError("Faltan los encabezados en la fila 2.")
         wanted = {"pais": "Pais", "destino": "Destino", "caracteristicas": "Caracteristicas", "precio (usd)": "Precio"}
         columns = {}
         for index, cell in enumerate(first):
@@ -107,12 +108,12 @@ def leer_excel(path, hoja=""):
                     raise ValidationError(f"Encabezado repetido: {name}.")
                 columns[name] = index
         if len(columns) != 4:
-            raise ValidationError("La primera fila debe contener Pais, Destino, Características y Precio (USD).")
+            raise ValidationError("La fila 2 debe contener Pais, Destino, Características y Precio (USD).")
         records = {}
         source_rows = {}
         errors = []
         count = duplicates = 0
-        for row_number, cells in enumerate(rows, start=2):
+        for row_number, cells in enumerate(rows, start=3):
             # Ignorar solo filas totalmente vacías, no registros incompletos.
             if all(c.value is None or (isinstance(c.value, str) and not c.value.strip()) for c in cells):
                 continue

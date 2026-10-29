@@ -42,7 +42,9 @@ Ejecutar `ejecutar.bat` o:
 
 Seleccionar un Excel `.xlsx`. Si el selector no está disponible, se pide la ruta
 en consola. Se usa la hoja activa; para fijar otra, configurar `excel.hoja`.
-La primera fila debe contener estos encabezados (en cualquier orden):
+La fila 1 se ignora: puede contener el título `FORMULARIO NUEVAS TARIFAS LDI`.
+La **fila 2** debe contener estos encabezados (en cualquier orden) y los **datos
+empiezan en la fila 3**. Los errores indican el número real de fila del Excel.
 
 | Pais | Destino | Características | Precio (USD) |
 | --- | --- | --- | --- |

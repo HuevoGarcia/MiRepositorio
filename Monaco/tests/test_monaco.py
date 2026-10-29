@@ -16,6 +16,8 @@ class ExcelTests(unittest.TestCase):
 
     def excel(self, rows, headers=None):
         book = Workbook()
+        book.active.append(["FORMULARIO NUEVAS TARIFAS LDI"])
+        book.active.merge_cells("A1:D1")
         book.active.append(headers or ["Pais", "Destino", "Características", "Precio (USD)"])
         for row in rows:
             book.active.append(row)
@@ -40,7 +42,7 @@ class ExcelTests(unittest.TestCase):
             with self.subTest(campo=index):
                 row = ["Malta", "Malta", "356", "0,18"]
                 row[index] = None
-                with self.assertRaisesRegex(ValidationError, "Fila 2"):
+                with self.assertRaisesRegex(ValidationError, "Fila 3"):
                     leer_excel(self.excel([row]))
 
     def test_segmento_vacio_rechaza_archivo(self):
@@ -55,7 +57,7 @@ class ExcelTests(unittest.TestCase):
         self.assertEqual(result.repetidos, 1)
 
     def test_clave_repetida_precio_distinto_rechaza_archivo(self):
-        with self.assertRaisesRegex(ValidationError, "precios diferentes"):
+        with self.assertRaisesRegex(ValidationError, r"Fila 4:.*precios diferentes.*fila 3"):
             leer_excel(self.excel([["Malta", "Malta", "356", "0,18"], ["Malta", "Malta", "356", "0,20"]]))
 
     def test_misma_caracteristica_otro_destino_es_otra_clave(self):
@@ -74,10 +76,31 @@ class ExcelTests(unittest.TestCase):
 
     def test_hoja_y_encabezados(self):
         path = self.excel([["Malta", "Malta", "356", "0,18"]], ["Pais", "Destino", "Caracteristicas", "Incorrecto"])
-        with self.assertRaisesRegex(ValidationError, "primera fila"):
+        with self.assertRaisesRegex(ValidationError, "fila 2"):
             leer_excel(path)
         with self.assertRaisesRegex(ValidationError, "No existe la hoja"):
             leer_excel(path, "NoExiste")
+
+    def test_fila_1_se_ignora_aunque_contenga_otros_encabezados(self):
+        path = self.excel([["Malta", "Malta", "356", "0,18"]])
+        from openpyxl import load_workbook
+        book = load_workbook(path)
+        book.active.unmerge_cells("A1:D1")
+        for index, value in enumerate(["Precio (USD)", "Caracteristicas", "Destino", "Pais"], start=1):
+            book.active.cell(1, index, value)
+        book.save(path)
+        book.close()
+        result = leer_excel(path)
+        self.assertEqual(result.filas, 1)
+        self.assertEqual(result.registros[0].values(), ("Malta", "Malta", "356", "0,18"))
+
+    def test_titulo_sin_encabezados_rechazado(self):
+        book = Workbook()
+        book.active.append(["FORMULARIO NUEVAS TARIFAS LDI"])
+        book.save(self.path)
+        book.close()
+        with self.assertRaisesRegex(ValidationError, "fila 2"):
+            leer_excel(self.path)
 
     def test_filas_blancas_y_archivo_sin_registros(self):
         with self.assertRaisesRegex(ValidationError, "no contiene registros"):
