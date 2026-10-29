@@ -1,128 +1,106 @@
-# Carga de precios Monaco
+# Generador SQL de precios Monaco
 
-Script para Windows y **Python 3.14 de 64 bits**. Copiar esta carpeta completa a
-`C:\Python314\Source\Monaco`. La conexión usa la cuenta de Windows que ejecuta
-el programa, sin contraseñas en archivos.
+Para Windows y **Python 3.14 de 64 bits**. Copiar la carpeta completa a
+`C:\Python314\Source\Monaco`.
 
-## Instalación
+Valida un Excel y genera un archivo `.sql`. El usuario lo revisa y ejecuta en
+SQL Server Management Studio (SSMS), conectado a **DWHNET**, sobre
+**Auxiliar.dbo.PreciosMonaco**. Python no se conecta a la base: no necesita
+pyodbc, controlador ODBC ni configurar certificados de SQL Server. SSMS usa la
+conexión y los permisos que ya tiene el usuario.
 
-1. Instalar Python 3.14 con el lanzador `py` y Tcl/Tk (selector de archivos).
-2. Instalar **Microsoft ODBC Driver 18 for SQL Server de 64 bits** desde Microsoft:
-   https://learn.microsoft.com/sql/connect/odbc/download-odbc-driver-for-sql-server
-3. Ejecutar **`instalar.bat`** una vez. Crea el entorno `.venv`, instala las
-   dependencias y verifica que el controlador ODBC esté disponible. Usa
-   `C:\Python314\python.exe` o el lanzador `py -3.14`. Repetirlo permite reintentar
-   una instalación incompleta. Necesita acceso a Internet para las dependencias.
+## Instalación y uso
 
-También se puede instalar manualmente desde una consola:
+1. Tener Python 3.14 con Tcl/Tk para el selector de archivos.
+2. Ejecutar **`instalar.bat`** una vez: prepara `Monaco\.venv` e instala `openpyxl`.
+   Usa `C:\Python314\python.exe` o `py -3.14` y necesita Internet para descargar
+   dependencias. Si ya estaba instalado pyodbc, se puede conservar: no se utiliza.
+3. Ejecutar **`ejecutar.bat`** y seleccionar un `.xlsx`.
+4. Si es válido, se genera `salidas\monaco_FECHA_HORA.sql` y se muestra su ruta.
+
+Instalación manual equivalente:
 
 ```bat
 cd /d C:\Python314\Source\Monaco
 py -3.14 -m venv .venv
 .venv\Scripts\python.exe -m pip install -r requirements.txt
-```
-
-`config.ini` ya está configurado con el servidor **`DWHNET`**, base `Auxiliar` y
-tabla fija `dbo.PreciosMonaco`, según la conexión suministrada.
-Se necesitan conectividad a SQL Server y permisos SELECT, INSERT y UPDATE sobre
-la tabla. La autenticación es integrada (`Trusted_Connection=yes`).
-Ejecutar desde la sesión de Windows que tiene acceso al servidor, por ejemplo
-`temu\BSANCHEZ`; no se fija un usuario ni se guarda una contraseña en el script.
-Por defecto se cifra y verifica el certificado del servidor. Si falla la confianza,
-configurar un certificado válido y su CA en Windows; no desactivar la validación
-como solución automática. No hace falta instalar SQL Server en la computadora.
-
-## Uso
-
-Ejecutar `ejecutar.bat` o:
-
-```bat
 .venv\Scripts\python.exe monaco.py
 ```
 
-Seleccionar un Excel `.xlsx`. Si el selector no está disponible, se pide la ruta
-en consola. Se usa la hoja activa; para fijar otra, configurar `excel.hoja`.
-La fila 1 se ignora: puede contener el título `FORMULARIO NUEVAS TARIFAS LDI`.
-La **fila 2** debe contener estos encabezados (en cualquier orden) y los **datos
-empiezan en la fila 3**. Los errores indican el número real de fila del Excel.
+## Ejecutar el SQL
+
+1. Conectarse a `DWHNET` desde SSMS con el usuario habitual de Windows.
+2. Abrir el `.sql` generado y revisar su contenido.
+3. Ejecutar el archivo **completo**, sin seleccionar fragmentos. Por defecto tiene
+   `DECLARE @Aplicar bit = 0;`: muestra los nuevos, actualizados y sin cambios,
+   sin escribir en la tabla destino.
+4. Para confirmar, cambiar a **`DECLARE @Aplicar bit = 1;`** y ejecutar nuevamente
+   el archivo completo. El resultado indicará `Aplicado` y sus totales.
+
+El archivo contiene `USE [Auxiliar]`. Se requieren permisos SELECT, INSERT y
+UPDATE sobre `dbo.PreciosMonaco`. La decisión entre insertar y actualizar se
+hace al ejecutar el SQL, consultando la base en ese momento; Python no puede
+anticipar los totales sin conectarse. Los totales pueden cambiar entre la vista
+previa y la aplicación.
+
+La clave es **Pais + Destino + Caracteristicas**. Si existe, se actualiza solo el
+precio cuando difiere. Si no existe, se inserta. No se borran registros. Repetir
+la carga deja sin cambios los datos que ya coinciden. Los precios se guardan como
+texto con **punto decimal**: `0,16330` pasa a `0.1633`. Diferencias de formato en
+los precios existentes también pueden producir un UPDATE.
+
+El SQL utiliza las intercalaciones de las columnas de destino y rechaza claves
+repetidas según esas reglas, tanto en el Excel como en las filas de destino
+correspondientes a la carga. Escapa los apóstrofes de los datos y usa lotes de
+hasta 500 filas para respetar el límite de SQL Server de 1000 filas por INSERT VALUES.
+
+La carga es transaccional y revierte ante errores. En vista previa solo escribe
+en una tabla temporal que desaparece al revertir. No cambia el esquema permanente.
+Bloquea temporalmente la tabla durante cada vista previa/carga para evitar
+carreras; usar una ventana adecuada si tiene mucha actividad. La espera por
+bloqueos se limita a 30 segundos. Ejecutar sin otras transacciones abiertas.
+Un corte de conexión justo durante el commit puede dejar el resultado incierto:
+comprobar la tabla antes de reintentar.
+
+## Formato del Excel
+
+Se usa la hoja activa o la indicada en `config.ini`, campo `excel.hoja`.
+La fila 1 se ignora (título). La **fila 2** contiene los encabezados y los **datos
+comienzan en la fila 3**. Los encabezados pueden estar en cualquier orden:
 
 | Pais | Destino | Características | Precio (USD) |
 | --- | --- | --- | --- |
 | AFGHANISTAN | AFGHANISTAN MOBILE AWCC | 09370, 9371 | 0,16330 |
 
-Se toleran diferencias de acentos, mayúsculas y espacios en los encabezados.
-Cada característica separada por coma produce un registro con los otros campos
-iguales. Guardar los códigos como **texto en Excel** para preservar ceros iniciales
-y números de más de 15 dígitos: el script no puede recuperar información que Excel
-ya haya perdido. Los ceros de un formato visual numérico tampoco son parte del valor.
+- Cada característica separada por coma genera un registro independiente.
+- Los cuatro campos son obligatorios; se ignoran solo filas totalmente vacías.
+- Se rechazan fórmulas, errores de Excel, caracteres de control y valores que no
+  caben en `varchar(255)` con Windows-1252 de `Modern_Spanish_CI_AS`.
+- El precio acepta coma o punto decimal y debe ser no negativo, sin moneda ni
+  separadores de miles. Se conserva el valor decimal exacto y se quitan ceros
+  decimales finales innecesarios.
+- Una lista como `9370,,9371` se rechaza por tener una característica vacía.
+- Las claves idénticas con el mismo precio se procesan una vez. Con precios
+  distintos se rechaza la planilla y se informan las filas involucradas.
+- Guardar códigos como **texto en Excel** para conservar ceros iniciales y más de
+  15 dígitos. No se recuperan datos perdidos por Excel ni ceros de formato visual.
 
-Reglas de validación:
+Si una fila es inválida, no se genera SQL. Los errores indican su fila real.
 
-- Los cuatro campos son obligatorios. Solo se ignoran filas completamente vacías.
-- Cada valor resultante debe caber en `varchar(255)` con la página de códigos
-  Windows-1252 de la intercalación `Modern_Spanish_CI_AS` informada.
-- No se permiten fórmulas, errores de Excel ni caracteres de control en los campos.
-  Convertir fórmulas a valores antes de importar.
-- El precio debe ser no negativo y puede usar coma o punto decimal, sin moneda ni
-  separadores de miles. Se conserva exactamente su valor decimal, sin redondearlo,
-  y se almacena como texto con **punto decimal**, sin ceros decimales finales
-  innecesarios. Por ejemplo, `0,16330` en Excel se guarda como `0.1633` en SQL,
-  tanto en inserciones como en actualizaciones.
-- Una lista como `9370,,9371` se rechaza porque contiene una característica vacía.
-- Una clave repetida con el mismo precio se procesa una sola vez. Si trae precios
-  distintos, se rechaza el archivo y se indican las filas involucradas.
-
-Tras validar **todo** el Excel, el programa consulta SQL y muestra nuevos,
-actualizados y sin cambios. Escribir `SI` para aplicar; cualquier otra respuesta
-cancela sin cambios. La carga vuelve a comprobar el estado de SQL al confirmar,
-por lo que los totales finales pueden variar si otro proceso modificó la tabla.
-
-La clave es **Pais + Destino + Caracteristicas**, comparada con las intercalaciones
-de las columnas de SQL Server (incluyendo sus reglas de mayúsculas y espacios).
-Si existe, se actualiza únicamente `Precio`; si no existe, se inserta. Un precio
-que ya coincide se cuenta sin cambios. Como la columna es varchar, diferencias
-de formato respecto del precio normalizado también pueden producir un UPDATE.
-Los registros ajenos a la carga se conservan.
-
-Si el Excel tiene claves equivalentes según SQL (por ejemplo, `Malta` y `MALTA`),
-se rechaza para que se unifiquen explícitamente. Si la tabla ya contiene varias
-filas para alguna clave de la carga, se detiene sin modificarlas: deben resolverse
-esos duplicados antes de reintentar. No se cambia el esquema ni se crean índices.
-
-Toda la escritura usa parámetros y una única transacción. Ante un error anterior
-al commit se revierte el lote completo. Se bloquea la tabla durante cada consulta
-de resumen/carga para impedir carreras entre importaciones; el bloqueo se libera
-antes de pedir confirmación. Esto puede bloquear temporalmente otros procesos:
-usar una ventana de carga adecuada si la tabla tiene mucha actividad. La espera
-por bloqueos se limita a 30 segundos. Un corte de conexión justo durante el commit
-puede dejar su resultado incierto; comprobar la tabla antes de reintentar.
-
-Cada ejecución genera un archivo en `logs` con su resultado o errores. Estos
-archivos pueden contener datos de filas inválidas; conservarlos de acuerdo con
-las políticas de la organización. No hay contraseñas en el programa.
-
-### Validar sin conectarse a SQL Server
+## Opciones y pruebas
 
 ```bat
+.venv\Scripts\python.exe monaco.py --archivo "C:\Tarifas\precios.xlsx"
+.venv\Scripts\python.exe monaco.py --archivo "C:\Tarifas\precios.xlsx" --salida "C:\Tarifas\carga.sql"
 .venv\Scripts\python.exe monaco.py --archivo "C:\Tarifas\precios.xlsx" --validar
-```
-
-También se admite `--config "C:\ruta\otra-config.ini"`.
-
-## Pruebas
-
-Desde esta carpeta:
-
-```bat
 .venv\Scripts\python.exe -m unittest discover -s tests -v
 ```
 
-Las pruebas generan archivos Excel reales y verifican expansión, obligatoriedad,
-precios, duplicados y errores. Las pruebas transaccionales usan un doble de ODBC;
-no sustituyen la verificación con SQL Server real.
+`--validar` solo valida y no genera SQL; `--config` elige otro INI. El archivo de
+salida usa UTF-8 con BOM y no sobrescribe archivos existentes. Las carpetas
+`salidas` y `logs` son locales y se excluyen de Git. Los SQL contienen los datos
+del Excel: conservarlos y compartirlos según las políticas de la organización.
 
-Para la prueba final, usar una instancia de prueba con una copia de la estructura
-`Auxiliar.dbo.PreciosMonaco`: cargar un registro nuevo, repetir la carga (sin cambios)
-y cargar la misma clave con otro precio (una actualización). Verificar también
-que un Excel inválido y una cancelación no alteren la tabla. No ejecutar esta
-comprobación contra producción sin una planilla autorizada.
+Las pruebas cubren Excel reales, expansión de características, validaciones,
+escape de apóstrofes, precios con punto, lotes de 6018 registros e interfaz de
+consola. No ejecutan SQL Server: comprobar el SQL en una base de prueba con SSMS.

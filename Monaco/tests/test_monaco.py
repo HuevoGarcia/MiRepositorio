@@ -1,11 +1,10 @@
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import Mock
 
 from openpyxl import Workbook
 
-from monaco import Registro, ValidationError, cargar, leer_excel, precio
+from monaco import Registro, ValidationError, generar_sql, guardar_sql, leer_excel, main, precio
 
 
 class ExcelTests(unittest.TestCase):
@@ -116,65 +115,72 @@ class ExcelTests(unittest.TestCase):
         self.assertEqual(precio(0), "0")
         self.assertEqual(precio(0.00001), "0.00001")
 
-    def test_precio_normalizado_con_punto_para_parametros_sql(self):
+    def test_precio_normalizado_con_punto_para_sql(self):
         for value in ("0,16330", "0.16330", 0.1633):
             with self.subTest(value=value):
                 planilla = leer_excel(self.excel([["Malta", "Malta", "356", value]]))
-                connection = Mock()
-                connection.cursor.return_value.fetchone.side_effect = [None, (12,), None, (1, 0, 0)]
-                cargar(connection, planilla.registros, aplicar=True)
-                connection.cursor.return_value.executemany.assert_called_once_with(
-                    "INSERT INTO #MonacoCarga (Pais, Destino, Caracteristicas, Precio) VALUES (?, ?, ?, ?)",
-                    [("Malta", "Malta", "356", "0.1633")],
-                )
+                sql = generar_sql(planilla.registros)
+                self.assertIn("(N'Malta', N'Malta', N'356', N'0.1633')", sql)
+                self.assertNotIn("N'0,16330'", sql)
+
+    def test_cli_genera_sql_y_no_sobrescribe_archivos(self):
+        path = self.excel([["Malta", "Malta", "356", "0,18"]])
+        output = Path(self.temp.name) / "tarifas.sql"
+        self.assertEqual(main(["--archivo", str(path), "--salida", str(output)]), 0)
+        content = output.read_bytes()
+        self.assertTrue(content.startswith(b"\xef\xbb\xbf"))
+        self.assertIn("N'0.18'", content.decode("utf-8-sig"))
+        output.write_text("SQL revisado por usuario")
+        self.assertEqual(main(["--archivo", str(path), "--salida", str(output)]), 1)
+        self.assertEqual(output.read_text(), "SQL revisado por usuario")
+
+    def test_cli_excel_invalido_no_genera_sql(self):
+        path = self.excel([["Malta", "Malta", "356", None]])
+        output = Path(self.temp.name) / "tarifas.sql"
+        self.assertEqual(main(["--archivo", str(path), "--salida", str(output)]), 1)
+        self.assertFalse(output.exists())
+
+    def test_solo_validar_no_genera_sql(self):
+        path = self.excel([["Malta", "Malta", "356", "0,18"]])
+        output = Path(self.temp.name) / "tarifas.sql"
+        self.assertEqual(main(["--archivo", str(path), "--salida", str(output), "--validar"]), 0)
+        self.assertFalse(output.exists())
 
 
-class TransactionTests(unittest.TestCase):
-    """Verifican control transaccional con doble de ODBC, no conexión SQL real."""
+class SQLTests(unittest.TestCase):
+    def test_literales_no_permiten_escapar_del_valor(self):
+        sql = generar_sql([Registro("Côte d'Ivoire", "x'); DROP TABLE dbo.PreciosMonaco;--", "001", "0.18")])
+        self.assertIn("N'Côte d''Ivoire'", sql)
+        self.assertIn("N'x''); DROP TABLE dbo.PreciosMonaco;--'", sql)
+        self.assertIn("N'001'", sql)
 
-    def connection(self):
-        connection = Mock()
-        connection.cursor.return_value.fetchone.side_effect = [None, (12,), None, (1, 1, 1)]
-        return connection
+    def test_planilla_grande_respeta_limite_insert_values(self):
+        records = [Registro("Malta", "Malta", str(i), "0.18") for i in range(6018)]
+        sql = generar_sql(records)
+        batches = sql.split("INSERT INTO #MonacoCarga (Pais, Destino, Caracteristicas, Precio) VALUES\n")[1:]
+        self.assertEqual(len(batches), 13)
+        sizes = [batch.split(";", 1)[0].count("(N'Malta'") for batch in batches]
+        self.assertEqual(sum(sizes), 6018)
+        self.assertLessEqual(max(sizes), 1000)
+        self.assertIn("N'6017'", sql)
 
-    def test_preview_revierte_y_no_ejecuta_dml_destino(self):
-        connection = self.connection()
-        result = cargar(connection, [Registro("Malta", "Malta", "356", "0,18")])
-        self.assertEqual(result, (1, 1, 1))
-        connection.rollback.assert_called_once()
-        connection.commit.assert_not_called()
-        commands = [call.args[0].strip() for call in connection.cursor.return_value.execute.call_args_list]
-        self.assertFalse(any(sql.startswith(("UPDATE", "INSERT INTO dbo")) for sql in commands))
+    def test_destino_clave_y_confirmacion_en_sql(self):
+        sql = generar_sql([Registro("Malta", "Malta", "356", "0.18")])
+        self.assertIn("USE [Auxiliar];", sql)
+        self.assertIn("DECLARE @Aplicar bit = 0;", sql)
+        branch = sql.split("IF @Aplicar = 1", 1)[1]
+        self.assertIn("UPDATE t SET Precio = s.Precio", branch)
+        self.assertIn("INSERT INTO dbo.PreciosMonaco", branch)
+        self.assertIn("WHERE NOT EXISTS", branch)
+        self.assertIn("t.Pais = s.Pais AND t.Destino = s.Destino AND t.Caracteristicas = s.Caracteristicas", branch)
+        self.assertIn("ELSE\n        ROLLBACK TRANSACTION;", branch)
+        self.assertIn("IF XACT_STATE() <> 0 ROLLBACK TRANSACTION;", branch)
+        self.assertIn("WITH (TABLOCKX, HOLDLOCK)", sql)
+        self.assertEqual(sql.count("HAVING COUNT(*) > 1"), 2)
 
-    def test_aplicar_confirma_y_precio_es_unico_campo_actualizado(self):
-        connection = self.connection()
-        cargar(connection, [Registro("Malta", "Malta", "356", "0,18")], aplicar=True)
-        connection.commit.assert_called_once()
-        connection.rollback.assert_not_called()
-        commands = [call.args[0] for call in connection.cursor.return_value.execute.call_args_list]
-        self.assertTrue(any("UPDATE t SET Precio = s.Precio" in sql for sql in commands))
-        self.assertTrue(any("INSERT INTO dbo.PreciosMonaco" in sql for sql in commands))
-
-    def test_error_de_escritura_revierte(self):
-        connection = self.connection()
-        def execute(sql):
-            if sql.strip().startswith("INSERT INTO dbo"):
-                raise RuntimeError("Error de escritura")
-        connection.cursor.return_value.execute.side_effect = execute
-        with self.assertRaisesRegex(RuntimeError, "Error de escritura"):
-            cargar(connection, [Registro("Malta", "Malta", "356", "0,18")], aplicar=True)
-        connection.rollback.assert_called_once()
-        connection.commit.assert_not_called()
-
-    def test_duplicado_sql_cancela_sin_cambios(self):
-        for results in ([(1,)], [None, (12,), (1,)]):
-            with self.subTest(results=results):
-                connection = Mock()
-                connection.cursor.return_value.fetchone.side_effect = results
-                with self.assertRaisesRegex(ValidationError, "repetidas|varias filas"):
-                    cargar(connection, [Registro("Malta", "Malta", "356", "0,18")], aplicar=True)
-                connection.rollback.assert_called_once()
-                connection.commit.assert_not_called()
+    def test_sin_registros_rechazado(self):
+        with self.assertRaises(ValidationError):
+            generar_sql([])
 
 
 if __name__ == "__main__":

@@ -1,4 +1,4 @@
-"""Importación de tarifas Monaco desde Excel a SQL Server (Python 3.14)."""
+"""Generación de SQL de tarifas Monaco desde Excel (Python 3.14)."""
 
 import argparse
 import configparser
@@ -157,95 +157,110 @@ def configuracion(path):
     config = configparser.ConfigParser(interpolation=None)
     if not config.read(path, encoding="utf-8-sig"):
         raise ValidationError(f"No se encontró la configuración: {path}")
-    for key in ("servidor", "base", "driver"):
-        if not config.get("sqlserver", key, fallback="").strip():
-            raise ValidationError(f"Falta sqlserver.{key} en la configuración.")
-    if config.get("sqlserver", "base") != "Auxiliar":
-        raise ValidationError("La base configurada debe ser Auxiliar.")
     return config
-
-
-def conectar(config):
-    import pyodbc
-
-    section = config["sqlserver"]
-    driver = section["driver"]
-    if driver not in pyodbc.drivers():
-        raise ValidationError(f"No está instalado '{driver}'. Instalá Microsoft ODBC Driver 18 for SQL Server (64 bits).")
-    def quote(value):
-        return "{" + value.replace("}", "}}") + "}"
-    encrypt = section.get("encrypt", "yes").lower()
-    trust = section.get("trust_server_certificate", "no").lower()
-    if encrypt not in ("yes", "mandatory", "strict") or trust not in ("yes", "no"):
-        raise ValidationError("Configuración TLS inválida; encrypt debe ser yes, mandatory o strict.")
-    connection = (
-        f"DRIVER={quote(driver)};SERVER={quote(section['servidor'])};"
-        f"DATABASE={quote(section['base'])};Trusted_Connection=yes;"
-        f"Encrypt={encrypt};TrustServerCertificate={trust};"
-    )
-    return pyodbc.connect(connection, autocommit=False, timeout=section.getint("timeout", 30))
 
 
 MATCH = "t.Pais = s.Pais AND t.Destino = s.Destino AND t.Caracteristicas = s.Caracteristicas"
 
 
-def cargar(connection, registros, aplicar=False):
-    """Resumen coherente y carga atómica; bloquea el destino para evitar carreras.
+def literal_sql(value):
+    """Literal Unicode: los apóstrofes del Excel nunca cierran la cadena SQL."""
+    return "N'" + value.replace("'", "''") + "'"
 
-    La comparación usa la intercalación real de cada columna de SQL Server.
-    El bloqueo se libera antes de pedir confirmación (la vista previa hace rollback).
-    """
-    cursor = connection.cursor()
+
+def generar_sql(registros):
+    if not registros:
+        raise ValidationError("No hay registros para generar SQL.")
+    inserts = []
+    # SQL Server permite hasta 1000 filas en cada INSERT ... VALUES.
+    for offset in range(0, len(registros), 500):
+        values = ["(" + ", ".join(literal_sql(v) for v in r.values()) + ")"
+                  for r in registros[offset:offset + 500]]
+        inserts.append("INSERT INTO #MonacoCarga (Pais, Destino, Caracteristicas, Precio) VALUES\n"
+                       + ",\n".join(values) + ";")
+    datos = "\n\n".join(inserts)
+    return f"""-- Monaco: abrir y ejecutar el archivo COMPLETO en SSMS conectado a DWHNET.
+-- 0 = vista previa sin cambios; cambiar a 1 y ejecutar nuevamente para aplicar.
+USE [Auxiliar];
+IF @@TRANCOUNT <> 0
+BEGIN
+    RAISERROR(N'Ejecutar sin otra transaccion abierta.', 16, 1);
+    RETURN;
+END;
+SET NOCOUNT ON;
+SET XACT_ABORT ON;
+SET LOCK_TIMEOUT 30000;
+DECLARE @Aplicar bit = 0;
+
+IF OBJECT_ID(N'tempdb..#MonacoCarga') IS NOT NULL
+    THROW 50000, N'Ya existe #MonacoCarga en esta sesion. Abrir una nueva consulta.', 1;
+
+BEGIN TRY
+    BEGIN TRANSACTION;
+    SELECT TOP (0) Pais, Destino, Caracteristicas, Precio
+    INTO #MonacoCarga FROM dbo.PreciosMonaco;
+
+{datos}
+
+    IF EXISTS (SELECT 1 FROM #MonacoCarga
+               GROUP BY Pais, Destino, Caracteristicas HAVING COUNT(*) > 1)
+        THROW 50001, N'El Excel tiene claves repetidas segun la intercalacion SQL. Unificar esas filas.', 1;
+
+    DECLARE @Total bigint;
+    SELECT @Total = COUNT_BIG(*) FROM dbo.PreciosMonaco WITH (TABLOCKX, HOLDLOCK);
+    IF EXISTS (SELECT 1 FROM dbo.PreciosMonaco t
+               JOIN #MonacoCarga s ON {MATCH}
+               GROUP BY t.Pais, t.Destino, t.Caracteristicas HAVING COUNT(*) > 1)
+        THROW 50002, N'La tabla tiene varias filas para una clave de esta carga. Resolver duplicados.', 1;
+
+    DECLARE @Nuevos int, @Actualizados int, @SinCambios int;
+    SELECT
+        @Nuevos = COALESCE(SUM(CASE WHEN t.Pais IS NULL THEN 1 ELSE 0 END), 0),
+        @Actualizados = COALESCE(SUM(CASE WHEN t.Pais IS NOT NULL AND
+            (t.Precio IS NULL OR t.Precio <> s.Precio) THEN 1 ELSE 0 END), 0),
+        @SinCambios = COALESCE(SUM(CASE WHEN t.Pais IS NOT NULL AND
+            t.Precio = s.Precio THEN 1 ELSE 0 END), 0)
+    FROM #MonacoCarga s LEFT JOIN dbo.PreciosMonaco t ON {MATCH};
+
+    IF @Aplicar = 1
+    BEGIN
+        UPDATE t SET Precio = s.Precio FROM dbo.PreciosMonaco t
+        JOIN #MonacoCarga s ON {MATCH}
+        WHERE t.Precio IS NULL OR t.Precio <> s.Precio;
+
+        INSERT INTO dbo.PreciosMonaco (Pais, Destino, Caracteristicas, Precio)
+        SELECT s.Pais, s.Destino, s.Caracteristicas, s.Precio FROM #MonacoCarga s
+        WHERE NOT EXISTS (SELECT 1 FROM dbo.PreciosMonaco t WHERE {MATCH});
+
+        DROP TABLE #MonacoCarga;
+        COMMIT TRANSACTION;
+    END
+    ELSE
+        ROLLBACK TRANSACTION;
+
+    SELECT @Nuevos AS Nuevos, @Actualizados AS PreciosActualizados,
+           @SinCambios AS SinCambios,
+           CASE WHEN @Aplicar = 1 THEN N'Aplicado'
+                ELSE N'Vista previa: no se modificaron datos' END AS Resultado;
+END TRY
+BEGIN CATCH
+    IF XACT_STATE() <> 0 ROLLBACK TRANSACTION;
+    THROW;
+END CATCH;
+"""
+
+
+def guardar_sql(path, registros):
+    content = generar_sql(registros)
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    # No sobrescribir un archivo que el usuario ya haya revisado o editado.
     try:
-        cursor.execute("SET XACT_ABORT ON; SET LOCK_TIMEOUT 30000;")
-        # Clonar tipos e intercalaciones, sin cambiar la tabla real.
-        cursor.execute("SELECT TOP (0) Pais, Destino, Caracteristicas, Precio INTO #MonacoCarga FROM dbo.PreciosMonaco;")
-        cursor.executemany(
-            "INSERT INTO #MonacoCarga (Pais, Destino, Caracteristicas, Precio) VALUES (?, ?, ?, ?)",
-            [r.values() for r in registros],
-        )
-        cursor.execute("SELECT TOP (1) 1 FROM #MonacoCarga GROUP BY Pais, Destino, Caracteristicas HAVING COUNT(*) > 1;")
-        if cursor.fetchone():
-            raise ValidationError("El Excel tiene claves repetidas según la intercalación SQL (por ejemplo, diferencias de mayúsculas). Unificá esas filas.")
-        # Se requiere permiso SELECT/INSERT/UPDATE; no se crea ningún índice permanente.
-        cursor.execute("SELECT COUNT_BIG(*) FROM dbo.PreciosMonaco WITH (TABLOCKX, HOLDLOCK);")
-        cursor.fetchone()
-        cursor.execute(f"""
-            SELECT TOP (1) 1 FROM dbo.PreciosMonaco t
-            JOIN #MonacoCarga s ON {MATCH}
-            GROUP BY t.Pais, t.Destino, t.Caracteristicas HAVING COUNT(*) > 1;
-        """)
-        if cursor.fetchone():
-            raise ValidationError("La tabla tiene varias filas para una clave de esta carga. Resolver esos duplicados antes de importar; no se modificó ningún dato.")
-        cursor.execute(f"""
-            SELECT
-                COALESCE(SUM(CASE WHEN t.Pais IS NULL THEN 1 ELSE 0 END), 0),
-                COALESCE(SUM(CASE WHEN t.Pais IS NOT NULL AND (t.Precio IS NULL OR t.Precio <> s.Precio) THEN 1 ELSE 0 END), 0),
-                COALESCE(SUM(CASE WHEN t.Pais IS NOT NULL AND t.Precio = s.Precio THEN 1 ELSE 0 END), 0)
-            FROM #MonacoCarga s LEFT JOIN dbo.PreciosMonaco t ON {MATCH};
-        """)
-        summary = tuple(cursor.fetchone())
-        if aplicar:
-            cursor.execute(f"""
-                UPDATE t SET Precio = s.Precio FROM dbo.PreciosMonaco t
-                JOIN #MonacoCarga s ON {MATCH}
-                WHERE t.Precio IS NULL OR t.Precio <> s.Precio;
-            """)
-            cursor.execute(f"""
-                INSERT INTO dbo.PreciosMonaco (Pais, Destino, Caracteristicas, Precio)
-                SELECT s.Pais, s.Destino, s.Caracteristicas, s.Precio FROM #MonacoCarga s
-                WHERE NOT EXISTS (SELECT 1 FROM dbo.PreciosMonaco t WHERE {MATCH});
-            """)
-            cursor.execute("DROP TABLE #MonacoCarga;")
-            connection.commit()
-        else:
-            connection.rollback()
-        return summary
-    except BaseException:
-        connection.rollback()
-        raise
-    finally:
-        cursor.close()
+        with path.open("x", encoding="utf-8-sig", newline="\r\n") as output:
+            output.write(content)
+    except FileExistsError as exc:
+        raise ValidationError(f"Ya existe el archivo de salida: {path}. Elegí otro nombre.") from exc
+    return path.resolve()
 
 
 def seleccionar_archivo():
@@ -266,21 +281,17 @@ def seleccionar_archivo():
         return input("Ruta del archivo .xlsx: ").strip().strip('"')
 
 
-def resumen(result):
-    return f"Nuevos: {result[0]} | Precios actualizados: {result[1]} | Sin cambios: {result[2]}"
-
-
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--archivo", type=Path, help="Planilla .xlsx; si se omite, abre el selector.")
     parser.add_argument("--config", type=Path, default=BASE_DIR / "config.ini")
     parser.add_argument("--validar", action="store_true", help="Validar Excel sin conexión ni cambios en SQL Server.")
+    parser.add_argument("--salida", type=Path, help="Ruta del .sql; por defecto se guarda en salidas.")
     args = parser.parse_args(argv)
     log_dir = BASE_DIR / "logs"
     log_dir.mkdir(exist_ok=True)
     log_path = log_dir / f"monaco_{datetime.now():%Y%m%d_%H%M%S_%f}.log"
     logging.basicConfig(filename=log_path, encoding="utf-8", level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s", force=True)
-    connection = None
     try:
         path = args.archivo or seleccionar_archivo()
         if not path:
@@ -294,18 +305,13 @@ def main(argv=None):
         if args.validar:
             print("Excel válido. No se conectó ni modificó SQL Server.")
             return 0
-        connection = conectar(config)
-        print(f"Destino: {config['sqlserver']['servidor']} / Auxiliar.dbo.PreciosMonaco")
-        preview = cargar(connection, planilla.registros)
-        print("Vista previa: " + resumen(preview))
-        logging.info("Vista previa: %s", resumen(preview))
-        if input("Escribí SI para confirmar la carga: ").strip().upper() != "SI":
-            print("Carga cancelada. No se modificó la base.")
-            logging.info("Carga cancelada por el usuario.")
-            return 0
-        result = cargar(connection, planilla.registros, aplicar=True)
-        print("Carga completada: " + resumen(result))
-        logging.info("Carga confirmada: %s", resumen(result))
+        output = args.salida or BASE_DIR / "salidas" / f"monaco_{datetime.now():%Y%m%d_%H%M%S_%f}.sql"
+        output = guardar_sql(output, planilla.registros)
+        print(f"Archivo SQL generado: {output}")
+        print("Abrilo en SSMS conectado a DWHNET y ejecutalo completo para ver el resumen.")
+        print("Para aplicar, cambiá @Aplicar de 0 a 1 y ejecutalo completo nuevamente.")
+        print("El programa no se conectó ni modificó la base.")
+        logging.info("SQL generado: %s | Registros: %s", output, len(planilla.registros))
         return 0
     except (KeyboardInterrupt, EOFError):
         print("Operación cancelada.")
@@ -317,8 +323,6 @@ def main(argv=None):
         logging.error("%s: %s", type(exc).__name__, exc)
         return 1
     finally:
-        if connection is not None:
-            connection.close()
         print(f"Registro de ejecución: {log_path}")
 
 
